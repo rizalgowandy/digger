@@ -1,0 +1,137 @@
+package reporting
+
+import (
+	"fmt"
+	"github.com/diggerhq/digger/cli/pkg/core/utils"
+	"github.com/diggerhq/digger/libs/orchestrator"
+	"log"
+	"strings"
+	"time"
+)
+
+type CiReporter struct {
+	CiService         orchestrator.PullRequestService
+	PrNumber          int
+	IsSupportMarkdown bool
+	ReportStrategy    ReportStrategy
+}
+
+type StdoutReporter struct {
+	IsSupportMarkdown bool
+	ReportStrategy    ReportStrategy
+}
+
+func (ciReporter *CiReporter) Report(report string, reportFormatter func(report string) string) error {
+	return ciReporter.ReportStrategy.Report(ciReporter.CiService, ciReporter.PrNumber, report, reportFormatter, ciReporter.SupportsMarkdown())
+}
+
+func (ciReporter *CiReporter) SupportsMarkdown() bool {
+	return ciReporter.IsSupportMarkdown
+}
+
+type StdOutReporter struct{}
+
+func (reporter *StdOutReporter) Report(report string, reportFormatter func(report string) string) error {
+	log.Println(reportFormatter(report))
+	return nil
+}
+
+func (reporter *StdOutReporter) SupportsMarkdown() bool {
+	return false
+}
+
+type ReportStrategy interface {
+	Report(ciService orchestrator.PullRequestService, PrNumber int, report string, reportFormatter func(report string) string, supportsCollapsibleComment bool) error
+}
+
+type CommentPerRunStrategy struct {
+	TimeOfRun time.Time
+}
+
+func (strategy *CommentPerRunStrategy) Report(ciService orchestrator.PullRequestService, PrNumber int, report string, reportFormatter func(report string) string, supportsCollapsibleComment bool) error {
+	comments, err := ciService.GetComments(PrNumber)
+	if err != nil {
+		return fmt.Errorf("error getting comments: %v", err)
+	}
+
+	reportTitle := "Digger run report at " + strategy.TimeOfRun.Format("2006-01-02 15:04:05 (MST)")
+	return upsertComment(ciService, PrNumber, report, reportFormatter, comments, reportTitle, supportsCollapsibleComment)
+}
+
+func upsertComment(ciService orchestrator.PullRequestService, PrNumber int, report string, reportFormatter func(report string) string, comments []orchestrator.Comment, reportTitle string, supportsCollapsible bool) error {
+	report = reportFormatter(report)
+	var commentIdForThisRun interface{}
+	var commentBody string
+	for _, comment := range comments {
+		if strings.Contains(*comment.Body, reportTitle) {
+			commentIdForThisRun = comment.Id
+			commentBody = *comment.Body
+			break
+		}
+	}
+
+	if commentIdForThisRun == nil {
+		var comment string
+		if !supportsCollapsible {
+			comment = utils.AsComment(reportTitle)(report)
+		} else {
+			comment = utils.AsCollapsibleComment(reportTitle)(report)
+		}
+		_, err := ciService.PublishComment(PrNumber, comment)
+		if err != nil {
+			return fmt.Errorf("error publishing comment: %v", err)
+		}
+		return nil
+	}
+
+	// strip first and last lines
+	lines := strings.Split(commentBody, "\n")
+	lines = lines[1 : len(lines)-1]
+	commentBody = strings.Join(lines, "\n")
+
+	commentBody = commentBody + "\n\n" + report + "\n"
+
+	var completeComment string
+	if !supportsCollapsible {
+		completeComment = utils.AsComment(reportTitle)(commentBody)
+	} else {
+		completeComment = utils.AsCollapsibleComment(reportTitle)(commentBody)
+	}
+
+	err := ciService.EditComment(PrNumber, commentIdForThisRun, completeComment)
+
+	if err != nil {
+		return fmt.Errorf("error editing comment: %v", err)
+	}
+	return nil
+}
+
+type LatestRunCommentStrategy struct {
+	TimeOfRun time.Time
+}
+
+func (strategy *LatestRunCommentStrategy) Report(ciService orchestrator.PullRequestService, prNumber int, comment string, commentFormatting func(comment string) string, supportsMarkdown bool) error {
+	comments, err := ciService.GetComments(prNumber)
+	if err != nil {
+		return fmt.Errorf("error getting comments: %v", err)
+	}
+
+	reportTitle := "Digger latest run report"
+	return upsertComment(ciService, prNumber, comment, commentFormatting, comments, reportTitle, supportsMarkdown)
+}
+
+type MultipleCommentsStrategy struct{}
+
+func (strategy *MultipleCommentsStrategy) Report(ciService orchestrator.PullRequestService, PrNumber int, report string, formatter func(string) string, supportsMarkdown bool) error {
+	_, err := ciService.PublishComment(PrNumber, formatter(report))
+	return err
+}
+
+func (ciReporter *StdoutReporter) Report(report string, reportFormatting func(report string) string) error {
+	log.Printf("Info: %v", report)
+	return nil
+}
+
+func (ciReporter *StdoutReporter) SupportsMarkdown() bool {
+	return ciReporter.IsSupportMarkdown
+}
